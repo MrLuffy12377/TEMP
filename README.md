@@ -1,112 +1,126 @@
-# Instagram -> Telegram Forwarder
+# Telegram → AI Caption → Buffer pipeline
 
-Watches **Channel A** for messages containing Instagram links, downloads each
-video at the highest available quality, and re-uploads it to **Channel B**
-with a caption. A local SQLite database tracks which messages have already
-been handled, so it never re-downloads/re-uploads the same post, and can
-safely "catch up" on anything it missed while offline.
+Watches a Telegram channel for links, downloads the video at the highest
+available quality, backs it up to a second Telegram channel, writes a new
+caption with a model of your choice via OpenRouter, and schedules it to
+Buffer.
 
-## 1. Install dependencies
+```
+Channel A (links) → SQLite → yt-dlp (best quality) → Channel B (backup)
+                                                    → OpenRouter (new caption)
+                                                    → Cloudinary (public URL)
+                                                    → Buffer (schedule post)
+```
 
-You need Python 3.9+ and `ffmpeg` (yt-dlp uses it to merge video+audio).
+Each link moves through these statuses in order: `pending → downloaded →
+backed_up → captioned → hosted → done` (or `failed`, with the error saved).
+If the script crashes or you stop it, restarting picks up exactly where it
+left off — nothing gets re-downloaded or re-posted.
+
+## One thing worth knowing up front
+
+Buffer's API does **not** accept direct file uploads for post media — it
+only accepts a public URL it can fetch the file from
+([docs](https://developers.buffer.com/guides/hosting-media.html)). Since
+your videos live on your laptop, this pipeline pushes each one to
+Cloudinary's free tier first to get that public URL, then hands it to
+Buffer. That's the one extra hop beyond what you sketched.
+
+## 1. Install
+
+Requires Python 3.9+ and **ffmpeg** (yt-dlp needs it to merge separate
+best-video + best-audio streams into one file).
 
 ```bash
-sudo apt install ffmpeg      # Debian/Ubuntu
+# macOS
+brew install ffmpeg
+# Ubuntu/Debian
+sudo apt install ffmpeg
+# Windows
+choco install ffmpeg
+
 pip install -r requirements.txt
+cp .env.example .env
 ```
 
-## 2. Get Telegram API credentials
+## 2. Fill in `.env`
 
-1. Go to <https://my.telegram.org> and log in with your phone number.
-2. Open **API development tools** and create an app.
-3. Copy the `api_id` and `api_hash` into `main.py`:
+- **Telegram (`TELEGRAM_API_ID` / `TELEGRAM_API_HASH`)** — from
+  https://my.telegram.org → "API Development Tools". This logs in as your
+  own account (not a bot), so it can read any channel you're already a
+  member of and isn't limited by the Bot API's small file-size caps.
+  First run will prompt you in the terminal for your phone number and the
+  login code Telegram texts/sends you — after that it's saved in a
+  `.session` file (keep it secret, it's a real login credential).
+- **`CHANNEL_A` / `CHANNEL_B`** — `@username`, invite link, or numeric ID.
+  You must already be a member of both.
+- **`YTDLP_COOKIES_FILE`** (optional) — if a source needs a logged-in
+  Instagram/etc. account for higher quality or private content, export
+  `cookies.txt` from your browser (e.g. the "Get cookies.txt" extension)
+  and point this at it.
+- **`OPENROUTER_API_KEY`** — from https://openrouter.ai/keys. Set
+  `OPENROUTER_MODEL` to whatever model you want writing captions.
+- **`CLOUDINARY_*`** — free account at https://cloudinary.com/console,
+  credentials are on the dashboard.
+- **`BUFFER_API_KEY`** — personal API key from Settings → API in your
+  Buffer account (or https://publish.buffer.com/settings/api). Every
+  Buffer plan, including Free, includes API access.
+- **`BUFFER_CHANNEL_ID`** — you won't know this yet. Once `BUFFER_API_KEY`
+  is set, run:
 
-```python
-API_ID = 12345678
-API_HASH = "your_api_hash_here"
-```
+  ```bash
+  python setup_helpers.py orgs
+  python setup_helpers.py channels <organization_id>
+  ```
 
-This script logs in as **your own Telegram account** (via Telethon), not as
-a bot — that's what lets it read a channel's history and post into another
-channel you're a member/admin of. The first run will ask for your phone
-number and the login code sent to Telegram; after that it saves a
-`.session` file so you won't need to log in again.
+  and copy the `id` of the channel (e.g. your Instagram account connected
+  to Buffer) you want these posts going to.
 
-## 3. Configure the channels
-
-In `main.py`, set:
-
-```python
-SOURCE_CHANNEL = "channel_a_username"   # or a numeric ID, e.g. -100123456789
-DEST_CHANNEL   = "channel_b_username"
-```
-
-- Username form works for public channels (`"mychannel"`, no `@` needed).
-- For private channels, use the numeric chat ID (you can get it by
-  forwarding a message from the channel to `@userinfobot`, or by using
-  Telethon's `client.get_dialogs()` once to print IDs).
-- Your account must already be a member of Channel A and have posting
-  rights in Channel B.
-
-## 4. (Optional) Instagram cookies for private/rate-limited posts
-
-If you get login-required or rate-limit errors from Instagram:
-
-1. Log into Instagram in your browser.
-2. Export cookies to a Netscape-format `cookies.txt` (e.g. using a browser
-   extension like "Get cookies.txt").
-3. Set in `main.py`:
-   ```python
-   IG_COOKIES_FILE = "cookies.txt"
-   ```
-
-## 5. Run it
+## 3. Run
 
 ```bash
 python main.py
 ```
 
-On startup it will:
-1. Connect to Telegram (asks for login on first run only).
-2. **Catch up**: scan Channel A's history from the last message id it has
-   seen (stored in SQLite) up to now, processing any Instagram links found.
-3. **Listen live**: stay connected and process new messages as they arrive.
+It polls channel A every `POLL_INTERVAL_SECONDS` (default 60s), pulls in
+any new links, and works through the pipeline. Leave it running in a
+terminal, tmux/screen session, or as a background process on your laptop.
 
-Keep it running with `screen`, `tmux`, `pm2`, a `systemd` service, or in a
-Docker container, since it needs to stay connected to catch new messages.
+## Notes / things you may want to tune
 
-## How the database works (`insta_forwarder.db`)
+- **Quality**: `downloader.py` uses `bestvideo*+bestaudio/best` merged to
+  mp4 — the actual highest quality yt-dlp can find for that source.
+- **Rewriting the caption prompt**: edit `DEFAULT_PROMPT` in
+  `caption_ai.py` to match your voice/hashtag style.
+- **Multiple source accounts**: yt-dlp works with Instagram, TikTok,
+  YouTube, X/Twitter, and most other platforms out of the box — channel A
+  can contain links from any of them, no code changes needed. If a
+  particular account needs authenticated access, that's what
+  `YTDLP_COOKIES_FILE` is for.
+- **Buffer posting mode**: `BUFFER_MODE=addToQueue` adds to your existing
+  Buffer queue/schedule; set it to `shareNow` to post immediately instead.
+- **Rate limits**: Buffer's API is in public beta with per-plan request
+  caps (e.g. 100 requests/24h on the Free plan) — worth checking your plan
+  if you're processing a high volume of links.
+- **Disk space**: set `DELETE_LOCAL_AFTER_DONE=true` in `.env` to remove
+  the local file once it's backed up to channel B and posted — you'll
+  still have the Telegram backup copy.
+- **Rights to repost**: this pipeline can move video from any link to your
+  own accounts — make sure you actually have the rights/permission to
+  repost whatever channel A is pointing at before it goes out on Buffer.
 
-- `processed_messages` — one row per (message, link) processed, with
-  status (`done`/`failed`), the downloaded file path, the resulting
-  message id in Channel B, and any error. Anything already `done` is
-  skipped on re-runs.
-- `state` — stores `last_seen_id`, the highest Telegram message id
-  processed so far, used to resume correctly after a restart.
+## Files
 
-You can inspect it any time with:
-
-```bash
-sqlite3 insta_forwarder.db "SELECT * FROM processed_messages ORDER BY message_id DESC LIMIT 20;"
-```
-
-To force a re-download of a specific message, delete its row:
-
-```bash
-sqlite3 insta_forwarder.db "DELETE FROM processed_messages WHERE message_id = 12345;"
-```
-
-## Notes & limits
-
-- **File size**: a regular (non-Telegram-Premium) account can upload files
-  up to 2 GB via the API; Premium raises this to 4 GB. Very long/high-bitrate
-  reels could hit this.
-- **Rate limits**: hammering Instagram with many downloads back-to-back can
-  get you temporarily rate-limited or asked to log in — space out large
-  backlogs, and/or use `IG_COOKIES_FILE` above.
-- **Captions**: Telegram captions are capped at 1024 characters; the script
-  truncates the original Instagram caption to fit alongside the credited
-  uploader and source link.
-- **Rights**: only forward/repost content you have permission to redistribute
-  — the script credits the original uploader and links back to the source
-  post in every caption, but the legal responsibility for reposting is yours.
+| File                 | Responsibility                                   |
+| -------------------- | ------------------------------------------------- |
+| `config.py`           | Loads/validates `.env`                            |
+| `db.py`                | SQLite schema + state machine helpers             |
+| `reader.py`            | Reads channel A, extracts links                   |
+| `downloader.py`        | yt-dlp download at highest quality                |
+| `telegram_backup.py`   | Uploads to channel B                              |
+| `caption_ai.py`        | OpenRouter caption generation                     |
+| `media_host.py`        | Cloudinary upload (public URL for Buffer)         |
+| `buffer_client.py`     | Buffer GraphQL API (post creation, org/channel lookups) |
+| `setup_helpers.py`     | One-off CLI to find your `BUFFER_CHANNEL_ID`      |
+| `main.py`              | Orchestrates the loop                             |
+| `utils.py`             | URL-extraction helper                             |
